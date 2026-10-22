@@ -9,8 +9,8 @@ import LlmClient.LlmLib as L
 
 class FakeCall:
     """A streaming call: write() answers hello/__initengine__ by resolving the owner's pending future; cancel() is counted."""
-    def __init__(self, owner_ref, answer=True, die=None):
-        self.owner_ref, self.answer, self.cancelled, self.die = owner_ref, answer, 0, die
+    def __init__(self, owner_ref, answer=True, die=None, ending="error"):
+        self.owner_ref, self.answer, self.cancelled, self.die, self.ending = owner_ref, answer, 0, die, ending
         self._msgs = asyncio.Queue()
 
     async def write(self, msg):
@@ -25,8 +25,12 @@ class FakeCall:
         return self
 
     async def __anext__(self):
-        if self.die is not None:                # a stream that resets once ``die`` is set
+        if self.die is not None:                # a stream that ends once ``die`` is set
             await self.die.wait()
+            if self.ending == "cancel":
+                raise asyncio.CancelledError()
+            if self.ending == "eof":
+                raise StopAsyncIteration
             raise RuntimeError("stream reset")
         return await self._msgs.get()          # never yields unless fed; the reader task just waits
 
@@ -94,31 +98,45 @@ class ConnectStormTests(unittest.TestCase):
             asyncio.run(run())
         self.assertEqual(timeouts, [10, 30])
 
-    def test_dead_stream_fails_the_pending_reply_at_once(self):
-        """C: when the call stream dies, a waiting send_receive raises now (not after SendSurely's 300 s), and so does
-        any later send on that client, whichever happens first."""
+    def _dead_stream_case(self, ending):
+        """A pending send_receive must raise within a second when the stream ends by ``ending``
+        ('error' = AioRpcError-like exception, 'cancel' = local cancel, 'eof' = the server closed it cleanly)."""
         conn = FakeConnection()
 
         async def run():
-            # case 1: the request is pending, then the stream dies
             c = L.BidirectionalClient("llm", conn)
             conn.owner = lambda: c
             gate = asyncio.Event()
-            c.call = FakeCall(lambda: c, answer=False, die=gate)
+            c.call = FakeCall(lambda: c, answer=False, die=gate, ending=ending)
             reader = asyncio.create_task(c._read_call_stream())
             pending = asyncio.create_task(c.send_receive(L.SimpleMessage(mtype="ask", payload=b"")))
             await asyncio.sleep(0.05)
             t0 = asyncio.get_running_loop().time()
             gate.set()
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises((RuntimeError, ConnectionError)):
                 await asyncio.wait_for(pending, timeout=5)
-            await reader
+            if ending == "cancel":
+                with self.assertRaises(asyncio.CancelledError):
+                    await reader
+            else:
+                await reader
             self.assertLess(asyncio.get_running_loop().time() - t0, 1.0)
             self.assertFalse(c.is_connected)
-            # case 2: the stream died first; the next send must not wait at all
-            with self.assertRaises(ConnectionError):
+            with self.assertRaises(ConnectionError):          # and every later send on this client fails at once
                 await asyncio.wait_for(c.send_receive(L.SimpleMessage(mtype="ask", payload=b"")), timeout=5)
         asyncio.run(run())
+
+    def test_dead_stream_error(self):
+        """C: stream ends with an error."""
+        self._dead_stream_case("error")
+
+    def test_dead_stream_local_cancel(self):
+        """C: stream cancelled locally (CancelledError is a BaseException; the old code never saw it)."""
+        self._dead_stream_case("cancel")
+
+    def test_dead_stream_clean_end(self):
+        """C: the server closes the stream cleanly (no exception: the old code left the reply pending for 300 s)."""
+        self._dead_stream_case("eof")
 
 
 if __name__ == "__main__":

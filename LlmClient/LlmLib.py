@@ -87,6 +87,9 @@ class BidirectionalClient:
     # STREAM READERS (FIXED)
     # ----------------------------------------
     async def _read_call_stream(self):
+        # Three ways the stream can end, and every one must fail the pending reply (see _fail_pending): a status error
+        # (AioRpcError), a local cancel (CancelledError, a BaseException that a bare `except Exception` never sees), and a
+        # clean end-of-stream when the server closes the session (no exception at all: the loop just finishes).
         try:
             async for msg in self.call:
                 if self._msg_future and not self._msg_future.done():
@@ -97,10 +100,18 @@ class BidirectionalClient:
             # We mark as disconnected so sends will fail and trigger retry logic
             self.is_connected = False
             self._fail_pending(e)
+            return
+        except asyncio.CancelledError:
+            self.is_connected = False
+            self._fail_pending(ConnectionError("call stream cancelled"))
+            raise
         except Exception as e:
             print(f"Unexpected error in call stream (retrying)")
             self.is_connected = False
             self._fail_pending(e)
+            return
+        self.is_connected = False
+        self._fail_pending(ConnectionError("call stream ended"))
 
     def _fail_pending(self, exc):
         """A reply that will never come: fail the waiting send_receive now (and every later one on this dead stream), so
